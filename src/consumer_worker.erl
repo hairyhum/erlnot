@@ -16,8 +16,7 @@
     filters,
     time_window,
     batch_size,
-    destination,
-    index
+    destination
 }).
 
 %% API.
@@ -33,12 +32,15 @@ init([Config]) ->
     TimeWindow = maps:get(time_window, Config),
     BatchSize = maps:get(batch_size, Config),
     Destination = maps:get(destination, Config),
-    Index = data_reader:get_index(),
+    GroupId = maps:get(group_id, Config),
+
+    {ok, Subscriber} = consumer_subscriber:start_subscriber(GroupId, Filters, BatchSize),
+
     {ok, #state{filters = Filters,
                 time_window = TimeWindow,
                 batch_size = BatchSize,
                 destination = Destination,
-                index = Index}}.
+                subscriber = Subscriber}, 0}.
 
 handle_call(_, _From, State) ->
     {reply, ignored, State}.
@@ -46,29 +48,26 @@ handle_call(_, _From, State) ->
 handle_cast(_, State) ->
     {noreply, State}.
     
-handle_info(timeout, #state{filters = Filters,
-                            batch_size = BatchSize,
-                            time_window = TimeWindow,
+handle_info(timeout, #state{time_window = TimeWindow,
                             destination = Destination,
-                            index = Index} = State) ->
+                            subscriber = Subscriber} = State) ->
     TimeBefore = erlang:system_time(microsecond),
     TimeToWait = TimeBefore + TimeWindow,
-    {Data, NewIndex} = data_reader:filter_data_upto(Filters, BatchSize, Index),
-    data_sender:send_data(Data, Destination),
-    data_reader:confirm(NewIndex),
-    State1 = State#state{index = NewIndex},
+    {BatchId, Messages, _Offsets} = batch_receive:get_batch(Subscriber),
+    data_sender:send_data(Messages, Destination),
+    batch_receive:confirm(Subscriber, BatchId),
     TimeAfter = erlang:system_time(microsecond),
     case TimeToWait - TimeAfter of
         LTZ when LTZ =< 0 ->
-            {noreply, State1, 0};
+            {noreply, State, 0};
         TimeLeft ->
             case TimeLeft > 1000 of
                 true ->
-                    {noreply, State1, TimeLeft div 1000};
+                    {noreply, State, TimeLeft div 1000};
                 false ->
                     %% Busy wait
                     busy_wait(TimeToWait),
-                    {noreply, State1, 0}
+                    {noreply, State, 0}
             end
     end;
 handle_info(_Info, State) ->

@@ -3,8 +3,8 @@
 
 -behaviour(brod_group_subscriber_2).
 
--export([start/1]).
--export([init/2, handle_message/4]). %% callback api
+-export([start_subscriber/3]).
+-export([init/2, handle_message/4, handle_info/2]). %% callback api
 
 
 -record(state, {
@@ -21,7 +21,22 @@
   last_batch_id
 }).
 
+start_subscriber(GroupId, Filters, BatchSize) ->
+    Client = kafka_client:get_client(GroupId),
+    Topics = filters:get_topics(Filters),
+    %% TODO: review config
+    GroupConfig = [],
+    %% TODO: prefetch_count is 10 by default.
+    %% It does not make much sense yet, because we're acking every message.
+    ConsumerConfig = [],
+    brod_group_subscriber_2:start_link(
+      Client, GroupId, Topics, GroupConfig,
+      ConsumerConfig, ?MODULE, #{receiver => self(),
+                                 target_batch_size => BatchSize,
+                                 filters => Filters}).
+
 %% brod_group_subscriber behaviour callback
+
 init(_GroupId,
      #{receiver := Receiver,
        target_batch_size := BatchSize,
@@ -40,13 +55,12 @@ init(_GroupId,
     last_batch_id = init_batch_id()
   }}.
 
-init_batch_id() ->
-  {make_ref(), 1}.
-
-new_batch_id({Ref, Id}) ->
-  {Ref, Id + 1}.
-
 %% brod_group_subscriber behaviour callback
+%% TODO: alternatively this process may just send filtered data to the consumer mailbox
+%% up to the batch size and let the consumer ack or confirm the messages.
+%% In that case the consumer may control the frequency and filter will fill up to N messages in the
+%% consumer message box.
+%% Ack would mean "give more messages", confirm - commit offset and give more messages
 handle_message(Topic, Partition, Message, #state{buffer_full = true, delayed = Delayed} = State) ->
   %% Do not ack the messgae. Prefetch should stop consuming at some point.
   {ok, State#state{delayed = Delayed ++ [{Topic, Partition, Message}]}};
@@ -70,7 +84,13 @@ handle_info({ack_batch, BatchId}, #state{sent_batch_id = BatchId, sent_batch = B
   %% TODO: do we need to wait until the batch is full?
   State1 = State#state{sent_batch_id = none, sent_batch = none},
   State2 = maybe_send_batch(State1),
-  {ok, process_delayed_messages(State1)}.
+  {ok, process_delayed_messages(State2)}.
+
+init_batch_id() ->
+  {make_ref(), 1}.
+
+new_batch_id({Ref, Id}) ->
+  {Ref, Id + 1}.
 
 process_delayed_messages(#state{delayed = [], sent_batch_id = BatchId} = State) ->
   %% No more delayed messages. Buffer is still full if there is a batch id
@@ -82,8 +102,8 @@ process_delayed_messages(#state{delayed = [{Topic, Partition, Message} | Delayed
   brod_group_subscriber:ack(self(), Topic, Partition, Offset, false),
   case batch_ready(State1) of
     %% There is a batch already. Stop processing
-    true  -> maybe_send_batch(State1);
-    false -> process_delayed_messages(State1)
+    true  -> maybe_send_batch(State1#state{delayed = Delayed});
+    false -> process_delayed_messages(State1#state{delayed = Delayed})
   end.
 
 commit_batch({_, _, LastOffsets}) ->
@@ -106,7 +126,7 @@ maybe_add_message(Topic, Partition, Message, Offset,
                          filters = Filters,
                          count = Count,
                          last_offsets = LastOffsets} = State) ->
-  case filter_message(Message, State#state.filters) of
+  case message_filters:filter_message(Message, Filters) of
     %% Take messge
     true  -> State#state{messages = [Message | Messages],
                          count = Count + 1,
@@ -132,25 +152,7 @@ send_batch(#state{messages = Messages,
               messages = [],
               count = 0,
               last_offsets = #{}};
-send_batch(#state{sent_batch_id = SentBatchId}) ->
+send_batch(#state{sent_batch_id = _SentBatchId} = State) ->
   State#state{buffer_full = true}.
 
-
-%% @doc The brod client identified ClientId should have been started
-%% either by configured in sys.config and started as a part of brod application
-%% or started by brod:start_client/3
-%% @end
--spec start(brod:client_id()) -> {ok, pid()}.
-start(ClientId) ->
-  Topic  = <<"brod-test-topic-1">>,
-  %% commit offsets to kafka every 5 seconds
-  GroupConfig = [{offset_commit_policy, commit_to_kafka_v2},
-                 {offset_commit_interval_seconds, 5}
-                ],
-  GroupId = <<"my-unique-group-id-shared-by-all-members">>,
-  ConsumerConfig = [{begin_offset, earliest}],
-  brod:start_link_group_subscriber(ClientId, GroupId, [Topic],
-                                   GroupConfig, ConsumerConfig,
-                                   _CallbackModule  = ?MODULE,
-                                   _CallbackInitArg = []).
 
